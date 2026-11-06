@@ -24,14 +24,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.example.ai.ApiKeySettingsManager
 import com.example.data.DemoProjects
 import com.example.model.ProjectEntity
+import com.example.ui.editor.components.ApiKeyDialog
 import com.example.ui.editor.components.formatTime
 import com.example.ui.theme.*
 
@@ -41,10 +45,16 @@ fun HomeScreen(
     onOpenProject: (String) -> Unit,
     onImportVideo: (Uri) -> Unit,
     onSelectTemplate: (String) -> Unit,
+    onCloneLinkStyle: (referenceUrl: String, customPrompt: String) -> Unit,
     onNewProject: () -> Unit,
     onOpenTemplates: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val apiKeyManager = remember { ApiKeySettingsManager(context) }
+    var currentAiConfig by remember { mutableStateOf(apiKeyManager.loadConfig()) }
+    var showApiKeyPopup by remember { mutableStateOf(false) }
+
     val videoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
@@ -52,7 +62,9 @@ fun HomeScreen(
     }
 
     var showPromptHeroDialog by remember { mutableStateOf(false) }
-    var initialPromptInput by remember { mutableStateOf("Make this video cinematic and professional") }
+    var initialPromptInput by remember { mutableStateOf("Make this video cinematic and eye-catching") }
+    var referenceLinkInput by remember { mutableStateOf("") }
+    val clipboardManager = LocalClipboardManager.current
 
     Scaffold(
         containerColor = VibeBackground,
@@ -65,7 +77,7 @@ fun HomeScreen(
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp)
         ) {
-            // Header
+            // Header with Prominent API Key Popup Button
             item {
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(
@@ -91,21 +103,42 @@ fun HomeScreen(
                             )
                         }
                         Text(
-                            text = "Next-Gen Intelligent Video Editor",
+                            text = "Intelligent AI & Link Style Video Editor",
                             color = TextSecondary,
                             fontSize = 12.sp
                         )
                     }
 
-                    Box(
+                    // Prominent API Key Button on Home Header
+                    Button(
+                        onClick = {
+                            currentAiConfig = apiKeyManager.loadConfig()
+                            showApiKeyPopup = true
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (currentAiConfig.apiKey.isNotBlank()) EmeraldDark else VioletDark
+                        ),
+                        shape = RoundedCornerShape(20.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                         modifier = Modifier
-                            .background(VioletDark.copy(alpha = 0.4f), RoundedCornerShape(20.dp))
-                            .border(1.dp, VioletLight, RoundedCornerShape(20.dp))
-                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                            .height(36.dp)
+                            .border(
+                                1.dp,
+                                if (currentAiConfig.apiKey.isNotBlank()) EmeraldLight else VioletLight,
+                                RoundedCornerShape(20.dp)
+                            )
+                            .testTag("home_api_key_button")
                     ) {
+                        Icon(
+                            imageVector = Icons.Default.Key,
+                            contentDescription = "Set Free API Key",
+                            tint = if (currentAiConfig.apiKey.isNotBlank()) EmeraldLight else VioletLight,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
                         Text(
-                            text = "Gemini 3.8",
-                            color = VioletLight,
+                            text = if (currentAiConfig.apiKey.isNotBlank()) "API Key Active ✓" else "Insert API Key",
+                            color = Color.White,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -113,7 +146,76 @@ fun HomeScreen(
                 }
             }
 
-            // AI Hero Action Banner
+            // Custom Free API Key Banner Card (One-tap access to insert any Gemini / OpenAI / AI Studio key)
+            item {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .clickable {
+                            currentAiConfig = apiKeyManager.loadConfig()
+                            showApiKeyPopup = true
+                        }
+                        .testTag("custom_api_key_banner_card"),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF141D30)),
+                    border = CardDefaults.outlinedCardBorder().copy(
+                        brush = Brush.horizontalGradient(listOf(EmeraldLight, VioletLight))
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .background(EmeraldDark.copy(alpha = 0.6f), CircleShape)
+                                    .border(1.dp, EmeraldLight, CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Key,
+                                    contentDescription = null,
+                                    tint = EmeraldLight,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text(
+                                    text = if (currentAiConfig.apiKey.isNotBlank()) {
+                                        "Custom API Key Connected (${currentAiConfig.modelName})"
+                                    } else {
+                                        "Insert Any Free API Key (Gemini / OpenAI / AI Studio)"
+                                    },
+                                    color = Color.White,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = "Tap here to paste your own Gemini, Google AI Studio, OpenAI, or Groq API key for custom AI video editing",
+                                    color = TextSecondary,
+                                    fontSize = 11.sp,
+                                    lineHeight = 15.sp
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (currentAiConfig.apiKey.isNotBlank()) "Change" else "Add Key",
+                            color = EmeraldLight,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.ExtraBold
+                        )
+                    }
+                }
+            }
+
+            // AI Auto-Edit & Link Style Cloner Hero Card
             item {
                 Card(
                     modifier = Modifier
@@ -132,8 +234,8 @@ fun HomeScreen(
                             .background(
                                 Brush.horizontalGradient(
                                     colors = listOf(
-                                        Color(0xFF064E3B).copy(alpha = 0.5f),
-                                        Color(0xFF3B0764).copy(alpha = 0.5f)
+                                        Color(0xFF064E3B).copy(alpha = 0.55f),
+                                        Color(0xFF3B0764).copy(alpha = 0.55f)
                                     )
                                 )
                             )
@@ -154,23 +256,23 @@ fun HomeScreen(
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text(
-                                        text = "AI AUTO-EDIT",
+                                        text = "AI AUTO-EDIT & LINK STYLE CLONER",
                                         color = EmeraldLight,
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.ExtraBold,
-                                        letterSpacing = 1.sp
+                                        letterSpacing = 0.8.sp
                                     )
                                 }
                                 Spacer(modifier = Modifier.height(6.dp))
                                 Text(
-                                    text = "Describe your vision in plain words",
+                                    text = "Paste Video Link or Describe Your Edit",
                                     color = Color.White,
                                     fontSize = 16.sp,
                                     fontWeight = FontWeight.Bold
                                 )
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
-                                    text = "AI analyzes scenes, cuts silence, colors footage, and adds motion graphics automatically.",
+                                    text = "Copy any YouTube/TikTok/Reel link to clone its exact transitions, color grade, and captions — with interactive Live Preview!",
                                     color = TextSecondary,
                                     fontSize = 11.sp,
                                     lineHeight = 16.sp
@@ -184,7 +286,7 @@ fun HomeScreen(
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.ArrowForward,
+                                    imageVector = Icons.Default.Link,
                                     contentDescription = "Start",
                                     tint = Color.Black
                                 )
@@ -200,7 +302,6 @@ fun HomeScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // Import Video Button
                     Button(
                         onClick = {
                             videoPicker.launch(
@@ -229,27 +330,26 @@ fun HomeScreen(
                         )
                     }
 
-                    // Blank Project Button
                     Button(
-                        onClick = onNewProject,
-                        colors = ButtonDefaults.buttonColors(containerColor = VibeSurfaceElevated),
+                        onClick = { showPromptHeroDialog = true },
+                        colors = ButtonDefaults.buttonColors(containerColor = VioletDark),
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier
                             .weight(1f)
                             .height(50.dp)
-                            .border(1.dp, VibeBorder, RoundedCornerShape(12.dp))
-                            .testTag("new_project_button")
+                            .border(1.dp, VioletLight, RoundedCornerShape(12.dp))
+                            .testTag("clone_link_home_button")
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Add,
+                            imageVector = Icons.Default.ContentPasteSearch,
                             contentDescription = null,
-                            tint = TextPrimary,
+                            tint = Color.White,
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Blank Project",
-                            color = TextPrimary,
+                            text = "Clone Video Link",
+                            color = Color.White,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -265,7 +365,7 @@ fun HomeScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "PRESET TEMPLATES",
+                        text = "PRESET TEMPLATES (TAP TO EDIT)",
                         color = TextTertiary,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
@@ -331,7 +431,7 @@ fun HomeScreen(
                                 fontWeight = FontWeight.SemiBold
                             )
                             Text(
-                                text = "Pick a template above or import a video to start",
+                                text = "Pick a template above, paste a video link, or import a video to start",
                                 color = TextTertiary,
                                 fontSize = 11.sp
                             )
@@ -352,7 +452,20 @@ fun HomeScreen(
             }
         }
 
-        // AI Auto-Edit Prompt Dialog
+        // Custom API Key Popup Dialog on Home Screen
+        if (showApiKeyPopup) {
+            ApiKeyDialog(
+                initialConfig = currentAiConfig,
+                onSave = { newConfig ->
+                    apiKeyManager.saveConfig(newConfig)
+                    currentAiConfig = newConfig
+                    showApiKeyPopup = false
+                },
+                onDismiss = { showApiKeyPopup = false }
+            )
+        }
+
+        // AI Auto-Edit & Link Cloner Dialog
         if (showPromptHeroDialog) {
             AlertDialog(
                 onDismissRequest = { showPromptHeroDialog = false },
@@ -362,17 +475,55 @@ fun HomeScreen(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = EmeraldLight)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("AI Auto-Edit Prompt", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        Text("Clone Video Link or AI Edit", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     }
                 },
                 text = {
                     Column {
-                        Text(
-                            text = "How would you like Vibe Cut AI to transform your video?",
-                            color = TextSecondary,
-                            fontSize = 12.sp
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "1. Reference Video Link (Optional):",
+                                color = VioletLight,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            TextButton(
+                                onClick = {
+                                    val clipText = clipboardManager.getText()?.text
+                                    referenceLinkInput = if (!clipText.isNullOrBlank()) clipText else "https://youtube.com/shorts/viral-reference"
+                                }
+                            ) {
+                                Text("Paste Link", color = EmeraldLight, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        OutlinedTextField(
+                            value = referenceLinkInput,
+                            onValueChange = { referenceLinkInput = it },
+                            placeholder = { Text("https://youtube.com/shorts/... or TikTok/Reel link", fontSize = 11.sp, color = TextTertiary) },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = VioletLight,
+                                unfocusedBorderColor = VibeBorder,
+                                focusedTextColor = TextPrimary,
+                                unfocusedTextColor = TextPrimary
+                            ),
+                            singleLine = true
                         )
-                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Text(
+                            text = "2. Editing Instructions:",
+                            color = EmeraldLight,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
                         OutlinedTextField(
                             value = initialPromptInput,
                             onValueChange = { initialPromptInput = it },
@@ -385,9 +536,9 @@ fun HomeScreen(
                             ),
                             maxLines = 3
                         )
-                        Spacer(modifier = Modifier.height(8.dp))
+                        Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = "Try: 'Make it a fast-paced viral Short' or 'Cinematic color with smooth transitions'",
+                            text = "AI will analyze the link's editing style using your active API Key, show you a Live Preview, and ask your permission before applying!",
                             color = TextTertiary,
                             fontSize = 10.sp
                         )
@@ -397,12 +548,11 @@ fun HomeScreen(
                     Button(
                         onClick = {
                             showPromptHeroDialog = false
-                            // Load Cyberpunk or Travel template with the custom prompt
-                            onSelectTemplate("template_cyberpunk")
+                            onCloneLinkStyle(referenceLinkInput, initialPromptInput)
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = EmeraldPrimary)
                     ) {
-                        Text("Open in AI Editor", color = Color.Black, fontWeight = FontWeight.Bold)
+                        Text("Analyze & Preview in Editor", color = Color.Black, fontWeight = FontWeight.Bold)
                     }
                 },
                 dismissButton = {

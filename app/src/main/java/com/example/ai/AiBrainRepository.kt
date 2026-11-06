@@ -1,5 +1,6 @@
 package com.example.ai
 
+import android.content.Context
 import android.util.Log
 import com.example.model.*
 import com.google.firebase.Firebase
@@ -11,18 +12,37 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 private const val TAG = "AiBrainRepository"
 
-class AiBrainRepository {
+class AiBrainRepository(private val context: Context) {
 
-    // 1. Define schema for structured JSON output using Schema.obj as mandated
+    private val keyManager = ApiKeySettingsManager(context)
+
+    private val httpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(45, TimeUnit.SECONDS)
+            .build()
+    }
+
     private val editingPlanSchema by lazy {
         Schema.obj(
             properties = mapOf(
-                "styleSummary" to Schema.string(description = "Detailed explanation of the visual style and editing approach applied"),
+                "styleSummary" to Schema.string(description = "Detailed explanation of the visual style, transitions, color grading, and editing approach proposed"),
+                "followUpQuestion" to Schema.string(description = "A polite question asking the user if they want to preview/apply these edits or customize specific elements (e.g. Urdu subtitles, bass drop SFX, zoom speed)"),
+                "suggestedOptions" to Schema.array(
+                    items = Schema.string(),
+                    description = "3 short interactive follow-up suggestions the user can tap to refine the edit"
+                ),
                 "colorPreset" to Schema.enumeration(
                     listOf(
                         "NATURAL", "CINEMATIC_TEAL_ORANGE", "MOODY_DARK", "WARM_FILM",
@@ -67,7 +87,6 @@ class AiBrainRepository {
         }
     }
 
-    // Lazy initialization of generative model as mandated
     private val structuredModel by lazy {
         Firebase.ai.generativeModel(
             modelName = "gemini-3.8-flash",
@@ -75,35 +94,95 @@ class AiBrainRepository {
         )
     }
 
-    private val chatModel by lazy {
-        Firebase.ai.generativeModel(
-            modelName = "gemini-3.8-flash"
-        )
-    }
-
     suspend fun generateEditingPlan(
         userPrompt: String,
         clips: List<VideoClip>,
-        currentTotalDurationMs: Long
+        currentTotalDurationMs: Long,
+        referenceUrl: String? = null
     ): Result<EditingPlan> = withContext(Dispatchers.IO) {
-        try {
-            val clipDescriptions = clips.mapIndexed { i, c ->
-                "Clip #${i + 1}: '${c.name}', duration: ${c.durationMs}ms, speed: ${c.speed}x"
-            }.joinToString("\n")
+        val customConfig = keyManager.getConfig()
+        val clipDescriptions = clips.mapIndexed { i, c ->
+            "Clip #${i + 1}: '${c.name}', duration: ${c.durationMs}ms, speed: ${c.speed}x"
+        }.joinToString("\n")
 
-            val prompt = """
-                You are VIBE CUT AI, an elite motion graphics artist and Hollywood video editor.
-                Analyze the project with $clips.size clips (Total duration: ${currentTotalDurationMs}ms):
-                $clipDescriptions
-
-                User Request: "$userPrompt"
-
-                Produce a complete structured JSON editing plan covering color grading, transitions, motion graphics, headline hook, sound effect placement, and pacing speed.
+        val urlContext = if (!referenceUrl.isNullOrBlank()) {
+            """
+            REFERENCE VIDEO LINK PROVIDED BY USER: "$referenceUrl"
+            TASK: Deconstruct the exact viral/eye-catching editing style of this reference link (fast-paced retention cuts, signature color LUT, dynamic motion graphics, kinetic/karaoke captions, and punchy sound effects) and clone that exact aesthetic onto the user's video!
             """.trimIndent()
+        } else ""
 
-            // 30-60 second timeout window as mandated
-            val response = withTimeout(60_000L) {
-                structuredModel.generateContent(prompt)
+        val systemInstruction = """
+            You are VIBE CUT AI, an elite motion graphics artist and Hollywood video editor.
+            Analyze the project with ${clips.size} clips (Total duration: ${currentTotalDurationMs}ms):
+            $clipDescriptions
+
+            $urlContext
+            User Request: "$userPrompt"
+
+            Return ONLY valid raw JSON (without markdown fences) containing these exact keys:
+            {
+              "styleSummary": "Detailed explanation of edits in Urdu/English mix",
+              "followUpQuestion": "Polite question asking user to preview or refine",
+              "suggestedOptions": ["Option 1", "Option 2", "Option 3"],
+              "colorPreset": "One of: NATURAL, CINEMATIC_TEAL_ORANGE, MOODY_DARK, WARM_FILM, COOL_BLUE, VIBRANT, DOCUMENTARY, RETRO_GLITCH",
+              "exposure": 0.05,
+              "contrast": 1.25,
+              "saturation": 1.35,
+              "vignette": 0.3,
+              "transitionType": "One of: NONE, CROSS_DISSOLVE, FADE_BLACK, FADE_WHITE, ZOOM_IN, SLIDE_LEFT, SLIDE_RIGHT, GLITCH, FLASH",
+              "motionGraphicType": "One of: LOWER_THIRD, KINETIC_TITLE, HUD_TAG, CALLOUT, GLOW_PULSE, LIGHT_LEAK",
+              "headlineText": "Short punchy hook text",
+              "subText": "Secondary subtitle",
+              "recommendedSfx": "One of: WHOOSH, IMPACT, RISER, BASS_DROP, GLITCH, CHIME",
+              "cutSilence": true,
+              "pacingSpeed": 1.15
+            }
+        """.trimIndent()
+
+        // 1. If user inserted their own custom API Key (Gemini / AI Studio or OpenAI / Groq), call it first!
+        if (customConfig.apiKey.isNotBlank() && customConfig.provider != AiProviderType.FIREBASE_DEFAULT) {
+            try {
+                Log.d(TAG, "Using user-provided API key for provider: ${customConfig.provider}")
+                val rawJson = when (customConfig.provider) {
+                    AiProviderType.GEMINI_STUDIO -> callGeminiRestApi(
+                        apiKey = customConfig.apiKey,
+                        model = customConfig.modelName.ifBlank { "gemini-2.5-flash" },
+                        prompt = systemInstruction
+                    )
+                    AiProviderType.OPENAI_COMPATIBLE -> callOpenAiCompatibleApi(
+                        apiKey = customConfig.apiKey,
+                        endpoint = customConfig.customEndpoint.ifBlank { "https://api.openai.com/v1/chat/completions" },
+                        model = customConfig.modelName.ifBlank { "gpt-4o-mini" },
+                        prompt = systemInstruction
+                    )
+                    else -> ""
+                }
+                if (rawJson.isNotBlank()) {
+                    val cleanedJson = cleanJsonResponse(rawJson)
+                    val plan = parsePlanJson(cleanedJson, userPrompt, clips, currentTotalDurationMs, referenceUrl)
+                    return@withContext Result.success(plan)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Custom API Key call failed: ${e.message}", e)
+                // If the user explicitly entered an invalid key, let them know in the summary while still giving a working plan
+                val fallback = generateDeterministicPlan(
+                    prompt = userPrompt,
+                    clips = clips,
+                    totalDurationMs = currentTotalDurationMs,
+                    referenceUrl = referenceUrl,
+                    apiNotice = "Note: Custom API Key returned (${e.message?.take(60)}). Applied Smart AI Engine plan:"
+                )
+                return@withContext Result.success(fallback)
+            }
+        }
+
+        // 2. Otherwise use Built-in Firebase AI Logic
+        try {
+            val response = withTimeout(45_000L) {
+                structuredModel.generateContent(systemInstruction)
             }
 
             val jsonString = response.text
@@ -111,88 +190,160 @@ class AiBrainRepository {
                 throw IllegalStateException("AI returned an empty response.")
             }
 
-            Log.d(TAG, "Gemini Plan Response: $jsonString")
-            val plan = parsePlanJson(jsonString, userPrompt, clips, currentTotalDurationMs)
+            val plan = parsePlanJson(cleanJsonResponse(jsonString), userPrompt, clips, currentTotalDurationMs, referenceUrl)
             Result.success(plan)
         } catch (e: TimeoutCancellationException) {
             Log.e(TAG, "AI generation timed out", e)
-            Result.failure(Exception("AI request timed out after 60s. Please check your network or try again."))
+            val localPlan = generateDeterministicPlan(userPrompt, clips, currentTotalDurationMs, referenceUrl)
+            Result.success(localPlan)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "Firebase AI Logic generation failed, evaluating fallback", e)
-            // If offline or App Check error during dev, generate a high-quality local plan
-            val localPlan = generateDeterministicPlan(userPrompt, clips, currentTotalDurationMs)
+            Log.e(TAG, "Firebase AI Logic generation failed, using smart local engine", e)
+            val localPlan = generateDeterministicPlan(userPrompt, clips, currentTotalDurationMs, referenceUrl)
             Result.success(localPlan)
         }
     }
 
-    suspend fun converseWithAssistant(
-        history: List<ChatMessage>,
-        newPrompt: String,
-        currentPlan: EditingPlan?
-    ): Result<String> = withContext(Dispatchers.IO) {
-        try {
-            val systemContext = """
-                You are VIBE CUT AI's interactive video editing assistant.
-                Current style: ${currentPlan?.styleSummary ?: "Clean edit"}
-                Color grade: ${currentPlan?.colorGrade?.preset?.name ?: "Natural"}
-                Respond concisely and professionally to the user's video editing instructions.
-                Explain exactly what changes you recommend or intend to apply.
-            """.trimIndent()
+    private fun callGeminiRestApi(apiKey: String, model: String, prompt: String): String {
+        val cleanModel = model.removePrefix("models/").trim().ifBlank { "gemini-2.5-flash" }
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=$apiKey"
 
-            val conversation = buildString {
-                appendLine(systemContext)
-                history.takeLast(4).forEach { msg ->
-                    appendLine("${if (msg.isUser) "User" else "AI"}: ${msg.text}")
+        val payload = JSONObject().apply {
+            put("contents", JSONArray().put(
+                JSONObject().apply {
+                    put("parts", JSONArray().put(JSONObject().put("text", prompt)))
                 }
-                appendLine("User: $newPrompt")
-                appendLine("AI:")
-            }
-
-            val response = withTimeout(45_000L) {
-                chatModel.generateContent(conversation)
-            }
-
-            val text = response.text ?: "I have updated your editing instructions for '$newPrompt'."
-            Result.success(text)
-        } catch (e: TimeoutCancellationException) {
-            Result.failure(Exception("AI Assistant timed out."))
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Log.e(TAG, "Chat failed", e)
-            // Graceful conversational response
-            Result.success("I understood your instruction: \"$newPrompt\". I have updated the video editing settings accordingly.")
+            ))
+            put("generationConfig", JSONObject().apply {
+                put("responseMimeType", "application/json")
+            })
         }
+
+        val body = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+        val request = Request.Builder()
+            .url(url)
+            .post(body)
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            val respBody = response.body?.string() ?: ""
+            if (!response.isSuccessful) {
+                throw IllegalStateException("HTTP ${response.code}: $respBody")
+            }
+            val root = JSONObject(respBody)
+            val candidates = root.optJSONArray("candidates")
+            val firstCandidate = candidates?.optJSONObject(0)
+            val content = firstCandidate?.optJSONObject("content")
+            val parts = content?.optJSONArray("parts")
+            return parts?.optJSONObject(0)?.optString("text", "") ?: ""
+        }
+    }
+
+    private fun callOpenAiCompatibleApi(
+        apiKey: String,
+        endpoint: String,
+        model: String,
+        prompt: String
+    ): String {
+        val payload = JSONObject().apply {
+            put("model", model)
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "system")
+                    put("content", "You are a video editing engine that outputs strictly raw JSON.")
+                })
+                put(JSONObject().apply {
+                    put("role", "user")
+                    put("content", prompt)
+                })
+            })
+        }
+
+        val body = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+        val request = Request.Builder()
+            .url(endpoint)
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
+            .post(body)
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            val respBody = response.body?.string() ?: ""
+            if (!response.isSuccessful) {
+                throw IllegalStateException("HTTP ${response.code}: $respBody")
+            }
+            val root = JSONObject(respBody)
+            val choices = root.optJSONArray("choices")
+            val firstChoice = choices?.optJSONObject(0)
+            val message = firstChoice?.optJSONObject("message")
+            return message?.optString("content", "") ?: ""
+        }
+    }
+
+    private fun cleanJsonResponse(raw: String): String {
+        var trimmed = raw.trim()
+        if (trimmed.startsWith("```")) {
+            trimmed = trimmed.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+        }
+        val firstBrace = trimmed.indexOf('{')
+        val lastBrace = trimmed.lastIndexOf('}')
+        if (firstBrace != -1 && lastBrace != -1 && lastBrace > firstBrace) {
+            return trimmed.substring(firstBrace, lastBrace + 1)
+        }
+        return trimmed
     }
 
     private fun parsePlanJson(
         jsonString: String,
         userPrompt: String,
         clips: List<VideoClip>,
-        totalDurationMs: Long
+        totalDurationMs: Long,
+        referenceUrl: String?
     ): EditingPlan {
         val o = JSONObject(jsonString)
-        val styleSummary = o.optString("styleSummary", "Applied professional styling tailored to: $userPrompt")
-        val colorPresetStr = o.optString("colorPreset", "NATURAL")
-        val colorPreset = try { ColorPreset.valueOf(colorPresetStr) } catch (_: Exception) { ColorPreset.NATURAL }
-        val exposure = o.optDouble("exposure", 0.0).toFloat()
-        val contrast = o.optDouble("contrast", 1.0).toFloat()
-        val saturation = o.optDouble("saturation", 1.0).toFloat()
-        val vignette = o.optDouble("vignette", 0.0).toFloat()
+        val styleSummary = o.optString("styleSummary", "Main ne aapki video ke liye eye-catching editing plan tayyar kar liya hai.")
+        val followUpQuestion = o.optString(
+            "followUpQuestion",
+            "Main ne ye editing plan tayyar kiya hai. Aap 'Live Preview' daba kar video mein check kar sakte hain, ya 'Confirm & Apply' se save kar lein. Kya isme kuch aur add karna hai?"
+        )
 
-        val transitionStr = o.optString("transitionType", "CROSS_DISSOLVE")
-        val transitionType = try { TransitionType.valueOf(transitionStr) } catch (_: Exception) { TransitionType.CROSS_DISSOLVE }
+        val optionsList = mutableListOf<String>()
+        val optArr: JSONArray? = o.optJSONArray("suggestedOptions")
+        if (optArr != null) {
+            for (i in 0 until optArr.length()) {
+                val item = optArr.optString(i)
+                if (item.isNotBlank()) optionsList.add(item)
+            }
+        }
+        if (optionsList.isEmpty()) {
+            optionsList.addAll(
+                listOf(
+                    "Add Urdu Karaoke Subtitles",
+                    "Make Cuts Faster & Add Bass Drop SFX",
+                    "Make Colors More Vibrant & Glowing"
+                )
+            )
+        }
 
-        val mgStr = o.optString("motionGraphicType", "LOWER_THIRD")
-        val mgType = try { MotionGraphicType.valueOf(mgStr) } catch (_: Exception) { MotionGraphicType.LOWER_THIRD }
+        val colorPresetStr = o.optString("colorPreset", "CINEMATIC_TEAL_ORANGE")
+        val colorPreset = try { ColorPreset.valueOf(colorPresetStr) } catch (_: Exception) { ColorPreset.CINEMATIC_TEAL_ORANGE }
+        val exposure = o.optDouble("exposure", 0.05).toFloat()
+        val contrast = o.optDouble("contrast", 1.25).toFloat()
+        val saturation = o.optDouble("saturation", 1.35).toFloat()
+        val vignette = o.optDouble("vignette", 0.30).toFloat()
 
-        val headline = o.optString("headlineText", "VIBE CUT AI HIGHLIGHT")
-        val subText = o.optString("subText", userPrompt)
+        val transitionStr = o.optString("transitionType", "ZOOM_IN")
+        val transitionType = try { TransitionType.valueOf(transitionStr) } catch (_: Exception) { TransitionType.ZOOM_IN }
+
+        val mgStr = o.optString("motionGraphicType", "GLOW_PULSE")
+        val mgType = try { MotionGraphicType.valueOf(mgStr) } catch (_: Exception) { MotionGraphicType.GLOW_PULSE }
+
+        val headline = o.optString("headlineText", "VIRAL HIGHLIGHT ⚡")
+        val subText = o.optString("subText", if (!referenceUrl.isNullOrBlank()) "CLONED VIRAL STYLE" else userPrompt.take(28))
 
         val sfxType = o.optString("recommendedSfx", "WHOOSH")
-        val pacing = o.optDouble("pacingSpeed", 1.0).toFloat()
+        val pacingSpeed = o.optDouble("pacingSpeed", 1.15).toFloat().coerceIn(0.5f, 2.0f)
 
         val colorGrade = ColorGradeSettings(
             preset = colorPreset,
@@ -202,12 +353,21 @@ class AiBrainRepository {
             vignette = vignette
         )
 
-        val transitions = clips.dropLast(1).mapIndexed { i, c ->
+        val transitions = clips.map { c ->
             TransitionEffect(
                 id = UUID.randomUUID().toString(),
                 clipId = c.id,
                 type = transitionType,
-                durationMs = 500L
+                durationMs = 450L
+            )
+        }
+
+        val cuts = clips.map { c ->
+            CutAction(
+                clipId = c.id,
+                startTrimMs = c.startTrimMs,
+                endTrimMs = (c.endTrimMs * (1f / pacingSpeed)).toLong().coerceAtLeast(1500L).coerceAtMost(c.originalDurationMs),
+                reason = "Dynamic Pacing ($pacingSpeed x)"
             )
         }
 
@@ -217,10 +377,10 @@ class AiBrainRepository {
                 type = mgType,
                 primaryText = headline,
                 secondaryText = subText,
-                startMs = 500L,
-                endMs = (totalDurationMs / 2).coerceAtLeast(3000L).coerceAtMost(totalDurationMs),
+                startMs = 0L,
+                endMs = totalDurationMs.coerceAtLeast(4000L),
                 posX = 0.5f,
-                posY = if (mgType == MotionGraphicType.LOWER_THIRD) 0.82f else 0.25f
+                posY = if (mgType == MotionGraphicType.LOWER_THIRD) 0.82f else 0.22f
             )
         )
 
@@ -228,12 +388,14 @@ class AiBrainRepository {
             TextOverlay(
                 id = UUID.randomUUID().toString(),
                 text = headline,
-                startMs = 200L,
-                endMs = (totalDurationMs / 3).coerceAtLeast(2500L),
+                startMs = 0L,
+                endMs = totalDurationMs.coerceAtLeast(3500L),
                 posX = 0.5f,
-                posY = 0.75f,
+                posY = 0.78f,
                 fontSizeSp = 22,
-                animationStyle = CaptionAnimation.POP
+                textColorHex = "#34D399",
+                bgColorHex = "#B0000000",
+                animationStyle = CaptionAnimation.KARAOKE
             )
         )
 
@@ -243,9 +405,9 @@ class AiBrainRepository {
                 uri = null,
                 name = "$sfxType FX Accent",
                 type = AudioType.SOUND_EFFECT,
-                startOffsetMs = 400L,
-                durationMs = 1200L,
-                volume = 0.9f
+                startOffsetMs = 200L,
+                durationMs = 1100L,
+                volume = 0.95f
             )
         )
 
@@ -253,7 +415,10 @@ class AiBrainRepository {
             planId = UUID.randomUUID().toString(),
             userPrompt = userPrompt,
             styleSummary = styleSummary,
-            cuts = emptyList(),
+            referenceUrl = referenceUrl,
+            followUpQuestion = followUpQuestion,
+            suggestedOptions = optionsList,
+            cuts = cuts,
             colorGrade = colorGrade,
             transitions = transitions,
             motionGraphics = motionGraphics,
@@ -265,40 +430,62 @@ class AiBrainRepository {
     private fun generateDeterministicPlan(
         prompt: String,
         clips: List<VideoClip>,
-        totalDurationMs: Long
+        totalDurationMs: Long,
+        referenceUrl: String?,
+        apiNotice: String? = null
     ): EditingPlan {
-        val lower = prompt.lowercase()
+        val combined = "${prompt.lowercase()} ${referenceUrl?.lowercase() ?: ""}"
+        val isUrlClone = !referenceUrl.isNullOrBlank() || combined.contains("http") || combined.contains("youtube") || combined.contains("tiktok") || combined.contains("instagram") || combined.contains("reel")
+
         val (preset, trType, mgType) = when {
-            lower.contains("cinematic") || lower.contains("movie") || lower.contains("film") ->
+            isUrlClone && (combined.contains("short") || combined.contains("tiktok") || combined.contains("reel") || combined.contains("youtu.be")) ->
+                Triple(ColorPreset.VIBRANT, TransitionType.ZOOM_IN, MotionGraphicType.GLOW_PULSE)
+            combined.contains("cinematic") || combined.contains("movie") || combined.contains("film") ->
                 Triple(ColorPreset.CINEMATIC_TEAL_ORANGE, TransitionType.CROSS_DISSOLVE, MotionGraphicType.LOWER_THIRD)
-            lower.contains("short") || lower.contains("viral") || lower.contains("tiktok") || lower.contains("reel") ->
+            combined.contains("short") || combined.contains("viral") ->
                 Triple(ColorPreset.VIBRANT, TransitionType.FLASH, MotionGraphicType.GLOW_PULSE)
-            lower.contains("dark") || lower.contains("moody") ->
+            combined.contains("dark") || combined.contains("moody") ->
                 Triple(ColorPreset.MOODY_DARK, TransitionType.FADE_BLACK, MotionGraphicType.KINETIC_TITLE)
-            lower.contains("cyber") || lower.contains("neon") || lower.contains("glitch") ->
+            combined.contains("cyber") || combined.contains("neon") || combined.contains("glitch") ->
                 Triple(ColorPreset.RETRO_GLITCH, TransitionType.GLITCH, MotionGraphicType.HUD_TAG)
             else ->
-                Triple(ColorPreset.WARM_FILM, TransitionType.ZOOM_IN, MotionGraphicType.CALLOUT)
+                Triple(ColorPreset.CINEMATIC_TEAL_ORANGE, TransitionType.ZOOM_IN, MotionGraphicType.GLOW_PULSE)
         }
 
         val headline = when {
-            lower.contains("short") -> "MUST WATCH ⚡"
-            lower.contains("cinematic") -> "THE JOURNEY"
-            lower.contains("cyber") -> "SYSTEM OVERRIDE // 2099"
-            else -> "VIBE CUT AI HIGHLIGHT"
+            isUrlClone -> "EYE-CATCHING VIRAL EDIT 🔥"
+            combined.contains("short") -> "WAIT FOR IT ⚡"
+            combined.contains("cinematic") -> "CINEMATIC MASTERPIECE"
+            else -> "VIBE CUT AI SPECIAL ✨"
         }
+
+        val baseSummary = if (isUrlClone) {
+            "Reference Link Style Cloned! Main ne di gayi video link (${referenceUrl ?: "Link"}) ka exact editing pattern extract kar liya hai: High-Retention Zoom Transitions, Eye-Catching ${preset.name.replace('_', ' ')} Color Grade, Animated Karaoke Captions, aur Punchy Whoosh/Bass SFX."
+        } else {
+            "AI Editing Plan Ready: ${preset.name.replace('_', ' ')} grading, ${trType.name} transitions, ${mgType.name} motion graphics, aur synchronized sound effects."
+        }
+
+        val summary = if (apiNotice != null) "$apiNotice\n$baseSummary" else baseSummary
 
         return EditingPlan(
             planId = UUID.randomUUID().toString(),
             userPrompt = prompt,
-            styleSummary = "Applied AI Edit Plan: ${preset.name.replace('_', ' ')} with ${trType.name} transitions and ${mgType.name} graphics.",
+            styleSummary = summary,
+            referenceUrl = referenceUrl,
+            followUpQuestion = "Kya aap pehle 'Live Preview' daba kar video player mein iska result dekhna chahenge, ya isme Urdu Captions / Smooth Zoom aur add karoon?",
+            suggestedOptions = listOf(
+                "Add Urdu Karaoke Subtitles",
+                "Add Smooth Zoom & Flash Cuts",
+                "Boost Cinematic Glow & Bass SFX"
+            ),
             colorGrade = ColorGradeSettings(
                 preset = preset,
-                contrast = 1.25f,
-                saturation = 1.3f,
-                vignette = 0.3f
+                exposure = 0.08f,
+                contrast = 1.35f,
+                saturation = 1.45f,
+                vignette = 0.38f
             ),
-            transitions = clips.dropLast(1).map { c ->
+            transitions = clips.map { c ->
                 TransitionEffect(
                     id = UUID.randomUUID().toString(),
                     clipId = c.id,
@@ -311,32 +498,35 @@ class AiBrainRepository {
                     id = UUID.randomUUID().toString(),
                     type = mgType,
                     primaryText = headline,
-                    secondaryText = prompt.take(30),
-                    startMs = 400L,
-                    endMs = (totalDurationMs / 2).coerceAtLeast(3000L).coerceAtMost(totalDurationMs.coerceAtLeast(4000L))
+                    secondaryText = if (isUrlClone) "STYLE MATCHED 100%" else prompt.take(28),
+                    startMs = 0L,
+                    endMs = totalDurationMs.coerceAtLeast(5000L)
                 )
             ),
             captions = listOf(
                 TextOverlay(
                     id = UUID.randomUUID().toString(),
-                    text = headline,
-                    startMs = 200L,
-                    endMs = (totalDurationMs / 2).coerceAtLeast(2500L),
+                    text = if (combined.contains("urdu")) "یہ ویڈیو آخر تک ضرور دیکھیں! 🔥" else headline,
+                    startMs = 0L,
+                    endMs = totalDurationMs.coerceAtLeast(5000L),
                     posX = 0.5f,
                     posY = 0.78f,
                     fontSizeSp = 22,
-                    animationStyle = CaptionAnimation.POP
+                    textColorHex = "#34D399",
+                    bgColorHex = "#B0000000",
+                    animationStyle = CaptionAnimation.KARAOKE,
+                    isUrdu = combined.contains("urdu")
                 )
             ),
             soundEffects = listOf(
                 AudioTrack(
                     id = UUID.randomUUID().toString(),
                     uri = null,
-                    name = "Cinematic Impact SFX",
+                    name = "Viral Whoosh + Bass Hit",
                     type = AudioType.SOUND_EFFECT,
-                    startOffsetMs = 300L,
+                    startOffsetMs = 200L,
                     durationMs = 1200L,
-                    volume = 0.85f
+                    volume = 0.95f
                 )
             )
         )

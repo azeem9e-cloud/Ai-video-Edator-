@@ -160,6 +160,12 @@ fun AppNavigation(
                             editorViewModel.loadTemplate(templateId)
                             isEditorOpen = true
                         },
+                        onCloneLinkStyle = { referenceUrl, customPrompt ->
+                            editorViewModel.loadTemplate("template_shorts")
+                            editorViewModel.setActiveSheet(com.example.ui.editor.EditorSheet.AI_PROMPT)
+                            editorViewModel.sendAiPrompt(customPrompt, referenceUrl.takeIf { it.isNotBlank() })
+                            isEditorOpen = true
+                        },
                         onNewProject = {
                             editorViewModel.loadTemplate("template_cyberpunk")
                             isEditorOpen = true
