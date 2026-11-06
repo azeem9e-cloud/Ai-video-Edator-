@@ -1,0 +1,7 @@
+{
+  "name": "Vibe Cut AI",
+  "description": "Advanced AI video editor with intelligent prompt-based editing, multi-track timeline, motion graphics, and MP4 export",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
